@@ -3,7 +3,6 @@ const AdmZip = require('adm-zip')
 const axios = require('axios')
 const spawn = require('child_process').spawnSync
 const fs = require('fs')
-const fetch = require('node-fetch')
 const path = require('path')
 const process = require('process')
 const stream = require('stream')
@@ -106,11 +105,8 @@ async function main() {
     }
 
     async function downloadBinary() {
-        const urls = [
-            new URL(`https://github.com/ilammy/setup-nasm/raw/mirror/releasebuilds/${version}/${platform}/nasm-${version}-${platform}.zip`),
-            new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/${platform}/nasm-${version}-${platform}.zip`),
-        ]
-        const buffer = await fetchFirstBuffer(urls)
+        const url = new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/${platform}/nasm-${version}-${platform}.zip`)
+        const buffer = await fetchBuffer(url)
         const zip = new AdmZip(buffer)
 
         // Pull out the one binary we're interested in from the downloaded archive,
@@ -135,11 +131,8 @@ async function main() {
     }
 
     async function buildFromSource() {
-        const urls = [
-            new URL(`https://github.com/ilammy/setup-nasm/raw/mirror/releasebuilds/${version}/nasm-${version}.tar.gz`),
-            new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/nasm-${version}.tar.gz`),
-        ]
-        const buffer = await fetchFirstBuffer(urls)
+        const url = new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/nasm-${version}.tar.gz`)
+        const buffer = await fetchBuffer(url)
         await extractTGZ(buffer, absNasmDir)
 
         // The tarball has all content in a versioned subdirectory: "nasm-2.16.01".
@@ -258,28 +251,15 @@ function appendFile(path, strings) {
     fs.appendFileSync(path, '\n' + strings.join('\n') + '\n')
 }
 
-async function fetchFirstBuffer(urls) {
-    let last_error
-    for (const url of urls) {
-        try {
-            return await fetchBuffer(url)
-        }
-        catch (error) {
-            last_error = error
-        }
-    }
-    throw last_error
-}
-
 async function fetchBuffer(url) {
     core.debug(`downloading ${url}...`)
-    const result = await fetch(url, {compress: false})
+    const result = await fetch(url)
     if (!result.ok) {
         const error = new Error(`HTTP GET failed: ${result.statusText}`)
         core.debug(`failed to fetch URL: ${error}`)
         throw error
     }
-    const buffer = await result.buffer()
+    const buffer = Buffer.from(await result.arrayBuffer())
     core.debug(`fetched ${buffer.length} bytes`)
     return buffer
 }
