@@ -1,0 +1,20 @@
+name: Set up NASM
+description: Download and install NASM
+inputs:
+  version:
+    description: NASM version to install
+    required: true
+    default: 2.16.01
+  from-source:
+    description: Force or deny compilation from source code
+  platform:
+    description: |
+      Override platform selection
+      One of: `dos`, `linux`, `macosx`, `win32`, `win64`
+      See https://www.nasm.us/pub/nasm/releasebuilds/ for available platforms.
+runs:
+  using: node24
+  main: dist/index.js
+branding:
+  icon: archive
+  color: blue
