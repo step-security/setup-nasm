@@ -24,7 +24,13 @@ function selectPlatform(platform) {
 }
 
 async function validateSubscription() {
-  const repoPrivate = process.env.GITHUB_REPOSITORY_VISIBILITY !== 'public'
+  let repoPrivate
+  const eventPath = process.env.GITHUB_EVENT_PATH
+  if (eventPath && fs.existsSync(eventPath)) {
+    const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
+    repoPrivate = payload?.repository?.private
+  }
+
   const upstream = 'ilammy/setup-nasm'
   const action = process.env.GITHUB_ACTION_REPOSITORY
   const docsUrl =
