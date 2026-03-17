@@ -1,0 +1,287 @@
+const core = require('@actions/core')
+const AdmZip = require('adm-zip')
+const axios = require('axios')
+const spawn = require('child_process').spawnSync
+const fs = require('fs')
+const path = require('path')
+const process = require('process')
+const stream = require('stream')
+const tar = require('tar-fs')
+const URL = require('url').URL
+const util = require('util')
+const zlib = require("zlib")
+
+// This could have been a ten-line shell script, but no, we are full-stack async now...
+// Though, it does look pretty in the Web console.
+
+// These are platform names as expected by NASM build archive
+function selectPlatform(platform) {
+    if (platform) { return platform }
+    if (process.platform == 'linux')  { return 'linux' }
+    if (process.platform == 'darwin') { return 'macosx' }
+    if (process.platform == 'win32')  { return 'win64' }
+    throw new Error(`unsupported platform: '${process.platform}'`)
+}
+
+async function validateSubscription() {
+  let repoPrivate
+  const eventPath = process.env.GITHUB_EVENT_PATH
+  if (eventPath && fs.existsSync(eventPath)) {
+    const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
+    repoPrivate = payload?.repository?.private
+  }
+
+  const upstream = 'ilammy/setup-nasm'
+  const action = process.env.GITHUB_ACTION_REPOSITORY
+  const docsUrl =
+    'https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions'
+
+  core.info('')
+  core.info('\u001B[1;36mStepSecurity Maintained Action\u001B[0m')
+  core.info(`Secure drop-in replacement for ${upstream}`)
+  if (repoPrivate === false)
+    core.info('\u001B[32m\u2713 Free for public repositories\u001B[0m')
+  core.info(`\u001B[36mLearn more:\u001B[0m ${docsUrl}`)
+  core.info('')
+
+  if (repoPrivate === false) return
+  const serverUrl = process.env.GITHUB_SERVER_URL || 'https://github.com'
+  const body = { action: action || '' }
+
+  if (serverUrl !== 'https://github.com') body.ghes_server = serverUrl
+
+  try {
+    await axios.post(
+      `https://agent.api.stepsecurity.io/v1/github/${process.env.GITHUB_REPOSITORY}/actions/maintained-actions-subscription`,
+      body,
+      { timeout: 3000 }
+    )
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 403) {
+      core.error(
+        `\u001B[1;31mThis action requires a StepSecurity subscription for private repositories.\u001B[0m`
+      )
+      core.error(
+        `\u001B[31mLearn how to enable a subscription: ${docsUrl}\u001B[0m`
+      )
+      process.exit(1)
+    }
+    core.info('Timeout or API not reachable. Continuing to next step.')
+  }
+}
+
+async function main() {
+    await validateSubscription()
+    const version = core.getInput('version', {required: true})
+    const destination = core.getInput('destination') || 'nasm'
+    const from_source = core.getInput('from-source')
+    // Yeah, these are strings... JavaScript at its finest
+    var try_binary = (from_source != 'true')
+    var try_source = (from_source != 'false')
+    const platform = selectPlatform(core.getInput('platform'))
+
+    const homedir = require('os').homedir()
+    const absNasmDir = path.resolve(homedir, destination)
+    const nasm = (process.platform == 'win32' ? 'nasm.exe' : 'nasm')
+    const ndisasm = (process.platform == 'win32' ? 'ndisasm.exe' : 'ndisasm')
+    const absNasmFile = path.join(absNasmDir, nasm)
+    const absNdisasmFile = path.join(absNasmDir, ndisasm)
+
+    if (!fs.existsSync(absNasmDir)) {
+        fs.mkdirSync(absNasmDir, {recursive: true})
+    }
+
+    // NASM publishes borked macOS binaries for older releases. Modern macOS
+    // does not support 32-bit binaries and for some reason throws "Bad CPU type"
+    // errors if a binary contain 32-bit code slice. Build old versions from source.
+    if (platform == 'macosx') {
+        let match = version.match(/^(\d+)\.(\d+)/)
+        let major = parseInt(match[1])
+        let minor = parseInt(match[2])
+        if (major < 2 || (major == 2 && minor < 14)) {
+            core.info(`Requested NASM version ${version} has incompatible prebuilt binaries.`)
+            core.info(`Only source builds are supported on macOS.`)
+            if (try_source) {
+                core.info(`Will try building from source.`)
+                try_binary = false
+            } else {
+                core.warning(`Trying binary build at your own risk.`)
+            }
+        }
+    }
+
+    async function downloadBinary() {
+        const url = new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/${platform}/nasm-${version}-${platform}.zip`)
+        const buffer = await fetchBuffer(url)
+        const zip = new AdmZip(buffer)
+
+        // Pull out the one binary we're interested in from the downloaded archive,
+        // overwrite anything that's there, and make sure the file is executable.
+        const nasmEntry = `nasm-${version}/${nasm}`
+        zip.extractEntryTo(nasmEntry, absNasmDir, false, true)
+        if (!fs.existsSync(absNasmFile)) {
+            core.debug(`nasm executable missing: ${absNasmFile}`)
+            throw new Error(`failed to extract to '${absNasmDir}'`)
+        }
+        fs.chmodSync(absNasmFile, '755')
+
+        const ndisasmEntry = `nasm-${version}/${ndisasm}`
+        zip.extractEntryTo(ndisasmEntry, absNasmDir, false, true)
+        if (!fs.existsSync(absNdisasmFile)) {
+            core.debug(`ndisasm executable missing: ${absNdisasmFile}`)
+            throw new Error(`failed to extract to '${absNasmDir}'`)
+        }
+        fs.chmodSync(absNdisasmFile, '755')
+
+        core.debug(`extracted NASM to '${absNasmDir}'`)
+    }
+
+    async function buildFromSource() {
+        const url = new URL(`https://www.nasm.us/pub/nasm/releasebuilds/${version}/nasm-${version}.tar.gz`)
+        const buffer = await fetchBuffer(url)
+        await extractTGZ(buffer, absNasmDir)
+
+        // The tarball has all content in a versioned subdirectory: "nasm-2.16.01".
+        const sourceDir = path.join(absNasmDir, `nasm-${version}`)
+        core.debug(`extracted NASM to '${sourceDir}'`)
+
+        // NASM uses the usual "./configure && make", but make sure we extracted
+        // everything correctly before jumping in.
+        const configurePath = path.join(sourceDir, 'configure')
+        if (!fs.existsSync(configurePath)) {
+            core.debug(`configure script missing: ${configurePath}`)
+            throw new Error(`failed to extract to '${sourceDir}'`)
+        }
+
+        // Now we can run "./configure". Node.js does not allow to change current
+        // working directory for the current process, so we use absolute paths.
+        execute([configurePath], {cwd: sourceDir})
+
+        // Now comes the fun part! Somehow, despite smoking Autocrack, NASM manages
+        // to botch up platform detection. Or that's Apple thinking different again,
+        // I don't know. Whatever it is, here are magic patches to make things work.
+        if (platform == 'linux' || platform == 'macosx') {
+            if (version.match(/2.14/)) {
+                appendFile(path.join(sourceDir, 'include/compiler.h'), [
+                    '#include <time.h>'
+                ])
+            }
+        }
+        if (platform == 'macosx') {
+            if (version.match(/2.14/)) {
+                appendFile(path.join(sourceDir, 'config/config.h'), [
+                    '#define HAVE_SNPRINTF 1',
+                    '#define HAVE_VSNPRINTF 1',
+                    '#define HAVE_INTTYPES_H 1'
+                ])
+            }
+            if (version.match(/2.13/)) {
+                appendFile(path.join(sourceDir, 'config/config.h'), [
+                    '#define HAVE_STRLCPY 1',
+                    '#define HAVE_DECL_STRLCPY 1',
+                    '#define HAVE_SNPRINTF 1',
+                    '#define HAVE_VSNPRINTF 1',
+                    '#define HAVE_INTTYPES_H 1'
+                ])
+            }
+            if (version.match(/2.12/)) {
+                appendFile(path.join(sourceDir, 'config.h'), [
+                    '#define HAVE_STRLCPY 1',
+                    '#define HAVE_DECL_STRLCPY 1',
+                    '#define HAVE_SNPRINTF 1',
+                    '#define HAVE_VSNPRINTF 1'
+                ])
+            }
+        }
+
+        // Finally, build the damn binary.
+        execute(['make', 'nasm', 'ndisasm'], {cwd: sourceDir})
+
+        core.debug(`compiled NASM in '${sourceDir}'`)
+
+        // The binary is expected at a slightly different place...
+        fs.renameSync(path.join(sourceDir, nasm), absNasmFile)
+        fs.renameSync(path.join(sourceDir, ndisasm), absNdisasmFile)
+    }
+
+    var made_it = false
+    if (try_binary && !made_it) {
+        try {
+            core.info('Downloading binary distribution...')
+            await downloadBinary()
+            made_it = true
+        }
+        catch (error) {
+            core.info(`binaries did not work: ${error}`)
+        }
+    }
+    if (try_source && !made_it) {
+        try {
+            core.info('Downloading source code...')
+            await buildFromSource()
+            made_it = true
+        }
+        catch (error) {
+            core.warning(`source code did not work: ${error}`)
+        }
+    }
+    if (!made_it) {
+        throw new Error("I'm sorry, Dave. I'm afraid I can't do that.")
+    }
+
+    execute([absNasmFile, '-version'])
+    execute([absNdisasmFile, '-version'])
+    core.addPath(absNasmDir)
+}
+
+function execute(cmdline, extra_options) {
+    core.startGroup(`${cmdline.join(' ')}`)
+    const options = {stdio: 'inherit'}
+    Object.assign(options, extra_options)
+    const result = spawn(cmdline[0], cmdline.slice(1), options)
+    core.endGroup()
+    if (result.error) {
+        core.debug(`failed to spawn process: ${result.error}`)
+        throw result.error
+    }
+    if (result.status !== 0) {
+        const command = path.basename(cmdline[0])
+        const error = new Error(`${command} failed: exit code ${result.status}`)
+        core.debug(`${error}`)
+        throw error
+    }
+    return result
+}
+
+function appendFile(path, strings) {
+    fs.appendFileSync(path, '\n' + strings.join('\n') + '\n')
+}
+
+async function fetchBuffer(url) {
+    core.debug(`downloading ${url}...`)
+    const result = await fetch(url)
+    if (!result.ok) {
+        const error = new Error(`HTTP GET failed: ${result.statusText}`)
+        core.debug(`failed to fetch URL: ${error}`)
+        throw error
+    }
+    const buffer = Buffer.from(await result.arrayBuffer())
+    core.debug(`fetched ${buffer.length} bytes`)
+    return buffer
+}
+
+async function extractTGZ(buffer, directory) {
+    core.info('Extracting source code...')
+    // Yes, I love async programming very much. So straightforward!
+    const gunzip = util.promisify(zlib.gunzip)
+    async function * data() {
+        yield await gunzip(buffer)
+    }
+    const tarball = stream.Readable.from(data())
+        .pipe(tar.extract(directory))
+    // Stream promise API is not available on GitHub Actions. Drain manually.
+    const finished = util.promisify(stream.finished)
+    return finished(tarball)
+}
+
+main().catch((e) => core.setFailed(`could not install NASM: ${e}`))
