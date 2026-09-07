@@ -24,13 +24,13 @@
   },
   "homepage": "https://github.com/step-security/setup-nasm#readme",
   "dependencies": {
-    "@actions/core": "^2.0.0",
-    "adm-zip": "^0.4.16",
-    "axios": "^1.13.6",
+    "@actions/core": "^2.0.3",
+    "adm-zip": "^0.6.0",
+    "axios": "^1.20.0",
     "tar-fs": "^2.1.1"
   },
   "devDependencies": {
-    "@vercel/ncc": "^0.38.4",
+    "@vercel/ncc": "^0.45.0",
     "eslint": "^7.13.0"
   }
 }
